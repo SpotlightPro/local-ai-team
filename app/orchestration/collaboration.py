@@ -1,3 +1,4 @@
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -140,6 +141,7 @@ def analyst_node(state: CollaborationState):
         Identify uncertainties and assumptions.
         """,
         provider_name="ollama",
+        model=os.getenv("LOCAL_AI_ANALYST_MODEL", "gpt-oss-20b:32k"),
     )
 
     prompt = (
@@ -167,6 +169,7 @@ def reviewer_node(state: CollaborationState):
         Do not automatically agree with the analyst.
         """,
         provider_name="ollama",
+        model=os.getenv("LOCAL_AI_REVIEWER_MODEL", "llama3.2:latest"),
     )
 
     prompt = f"""
@@ -201,6 +204,7 @@ def coordinator_node(state: CollaborationState):
         Do not hide unresolved disagreements.
         """,
         provider_name="ollama",
+        model=os.getenv("LOCAL_AI_COORDINATOR_MODEL", "gpt-oss-20b:32k"),
     )
 
     prompt = f"""

@@ -7,6 +7,7 @@ def create_agent(
     role: str,
     instructions: str,
     provider_name: str,
+    model: str = None,
 ) -> Agent:
 
     providers = get_providers()
@@ -16,9 +17,14 @@ def create_agent(
             f"Provider '{provider_name}' is not configured"
         )
 
+    provider = providers[provider_name]
+
+    if model:
+        provider.model = model
+
     return Agent(
         name=name,
         role=role,
         instructions=instructions,
-        provider=providers[provider_name]
+        provider=provider
     )
