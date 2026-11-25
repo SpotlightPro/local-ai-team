@@ -63,7 +63,45 @@ h1 { font-size:29px; margin-bottom:7px; }
 .wide { grid-column:span 2; }
 .full { grid-column:1/-1; }
 .section-title { margin:30px 0 15px; font-size:19px; }
+
 #tasks { display:grid; gap:10px; }
+.task-header {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+}
+.task-actions { margin-top:12px; }
+.task-results {
+  margin-top:15px;
+  display:grid;
+  gap:12px;
+}
+.task-result {
+  background:var(--bg);
+  border:1px solid var(--border);
+  border-radius:9px;
+  padding:15px;
+  min-width:0;
+}
+.task-result h3 {
+  font-size:14px;
+  margin:0 0 12px;
+}
+.task-result pre {
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  font-family:inherit;
+  font-size:13px;
+  line-height:1.65;
+  color:var(--text);
+  margin:0;
+}
+.task-results button {
+  margin-top:10px;
+}
+
 .task {
   background:var(--panel2); border:1px solid var(--border);
   border-radius:9px; padding:14px;
@@ -225,12 +263,135 @@ async function loadModels() {
 let taskPollingInterval = null;
 let taskPollInFlight = false;
 
+
+
+
+let lastTaskSnapshot = null;
+const expandedTaskIds = new Set();
+const taskResultsCache = new Map();
+const taskResultsPending = new Set();
+const taskResultsErrors = new Map();
+
+function renderTaskResults(taskId) {
+  const card = Array.from(
+    document.getElementById("tasks").children
+  ).find(item => item.dataset.taskId === taskId);
+
+  if (!card) return;
+
+  const container = card.querySelector(".task-results");
+  if (!container) return;
+
+  container.replaceChildren();
+
+  if (taskResultsErrors.has(taskId)) {
+    const message = document.createElement("p");
+    message.className = "muted";
+    message.textContent = taskResultsErrors.get(taskId);
+
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "Retry loading results";
+
+    retry.addEventListener("click", () => {
+      taskResultsErrors.delete(taskId);
+      loadTaskResults(taskId);
+    });
+
+    container.append(message, retry);
+    return;
+  }
+
+  if (taskResultsPending.has(taskId)) {
+    container.textContent = "Loading task results...";
+    return;
+  }
+
+  if (!taskResultsCache.has(taskId)) {
+    container.textContent = "No results loaded yet.";
+    return;
+  }
+
+  const results = taskResultsCache.get(taskId);
+
+  const labels = {
+    analysis: "Independent Analyst — Analysis",
+    critique: "Critical Reviewer — Critique",
+    final_report: "Team Coordinator — Final Report"
+  };
+
+  const visibleResults = results.filter(
+    result => result.result_type !== "artifact_paths"
+  );
+
+  if (!visibleResults.length) {
+    container.textContent = "No report results are available yet.";
+    return;
+  }
+
+  visibleResults.forEach(result => {
+    const panel = document.createElement("section");
+    panel.className = "task-result";
+
+    const heading = document.createElement("h3");
+    const resultType =
+      typeof result.result_type === "string"
+        ? result.result_type
+        : "Result";
+
+    heading.textContent =
+      labels[resultType] ||
+      resultType.replaceAll("_", " ");
+
+    const content = document.createElement("pre");
+    content.textContent = result.content || "";
+
+    panel.append(heading, content);
+    container.appendChild(panel);
+  });
+}
+
+async function loadTaskResults(taskId) {
+  if (taskResultsPending.has(taskId)) return;
+
+  taskResultsPending.add(taskId);
+  taskResultsErrors.delete(taskId);
+  renderTaskResults(taskId);
+
+  try {
+    const results = await request(
+      "/workspaces/default/tasks/" +
+      encodeURIComponent(taskId) +
+      "/results"
+    );
+
+    if (!Array.isArray(results)) {
+      throw new Error("Unexpected task results response.");
+    }
+
+    taskResultsCache.set(taskId, results);
+  } catch (error) {
+    taskResultsErrors.set(taskId, error.message);
+  } finally {
+    taskResultsPending.delete(taskId);
+    renderTaskResults(taskId);
+  }
+}
+
 async function loadTasks() {
   const container = document.getElementById("tasks");
 
   try {
     const tasks = await request("/workspaces/default/tasks");
 
+    const snapshot = JSON.stringify(tasks);
+
+    // Avoid rebuilding cards unnecessarily during automatic polling.
+    if (snapshot === lastTaskSnapshot) {
+      return tasks;
+    }
+
+    lastTaskSnapshot = snapshot;
     container.replaceChildren();
 
     if (!tasks.length) {
@@ -242,25 +403,77 @@ async function loadTasks() {
     let hasActiveTasks = false;
 
     tasks.forEach(task => {
-      const item = document.createElement("div");
-      item.className = "task";
-
-      const title = document.createElement("strong");
-      title.textContent = task.title || task.id || "Task";
-
-      const description = document.createElement("div");
-      description.className = "muted";
-      description.textContent =
-        "Status: " + (task.status || "Unknown");
-
+      const taskId = task.id;
       const status = (task.status || "").toLowerCase();
+      const expanded = expandedTaskIds.has(taskId);
 
-      if (["pending", "queued", "running", "processing"].includes(status)) {
+      const taskActive = [
+        "pending", "queued", "running", "processing"
+      ].includes(status);
+
+      if (taskActive) {
         hasActiveTasks = true;
       }
 
-      item.append(title, description);
+      const item = document.createElement("div");
+      item.className = "task";
+      item.dataset.taskId = taskId;
+
+      const header = document.createElement("div");
+      header.className = "task-header";
+
+      const title = document.createElement("strong");
+      title.textContent = task.title || taskId || "Task";
+
+      const description = document.createElement("div");
+      description.className = "muted";
+      description.textContent = "Status: " + (task.status || "Unknown");
+
+      header.append(title, description);
+
+      const actions = document.createElement("div");
+      actions.className = "task-actions";
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = expanded ? "Hide Results" : "View Results";
+      button.setAttribute("aria-expanded", String(expanded));
+
+      button.addEventListener("click", () => {
+        if (expandedTaskIds.has(taskId)) {
+          expandedTaskIds.delete(taskId);
+        } else {
+          expandedTaskIds.add(taskId);
+        }
+
+        loadTasks();
+      });
+
+      actions.appendChild(button);
+      item.append(header, actions);
+
+      if (expanded) {
+        const resultsContainer = document.createElement("div");
+        resultsContainer.className = "task-results";
+        item.appendChild(resultsContainer);
+      }
+
+      // Attach the card before rendering results into it.
       container.appendChild(item);
+
+      if (expanded) {
+        if (taskResultsCache.has(taskId) ||
+            taskResultsErrors.has(taskId) ||
+            taskResultsPending.has(taskId)) {
+          renderTaskResults(taskId);
+        } else if (taskActive) {
+          const resultsContainer = item.querySelector(".task-results");
+          resultsContainer.textContent =
+            "Results will be available when the task finishes.";
+        } else {
+          loadTaskResults(taskId);
+        }
+      }
     });
 
     if (hasActiveTasks) {
