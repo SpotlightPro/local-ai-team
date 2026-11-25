@@ -76,3 +76,158 @@ class APITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class APISecurityBoundaryTests(unittest.TestCase):
+
+    def setUp(self):
+        self.client = TestClient(app)
+        self.user = {
+            "user_id": "test-user",
+            "username": "tester",
+        }
+        self.headers = {
+            "Authorization": "Bearer test-token"
+        }
+
+    def request(self, method, path, target, result):
+        from unittest.mock import patch
+
+        with patch(
+            "app.api.get_session",
+            return_value=self.user,
+        ), patch(target, return_value=result) as mocked:
+            response = getattr(self.client, method)(
+                path,
+                headers=self.headers,
+            )
+
+        return response, mocked
+
+    def test_execution_listing_uses_authorization(self):
+        response, mocked = self.request(
+            "get",
+            "/api/workspaces/default/executions",
+            "app.api.list_authorized_agent_executions",
+            [],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        mocked.assert_called_once_with("test-user", "default")
+
+    def test_execution_cross_workspace_denied(self):
+        from unittest.mock import patch
+
+        with patch(
+            "app.api.get_session",
+            return_value=self.user,
+        ), patch(
+            "app.api.get_authorized_agent_execution",
+            side_effect=PermissionError,
+        ):
+            response = self.client.get(
+                "/api/workspaces/other/executions/123",
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_task_results_listing(self):
+        from unittest.mock import patch
+
+        with patch(
+            "app.api.get_session",
+            return_value=self.user,
+        ), patch(
+            "app.api.get_authorized_task_results",
+            return_value=[{"id": "result-1"}],
+        ), patch(
+            "app.api.get_authorized_task",
+            return_value={"id": "task-1"},
+        ):
+            response = self.client.get(
+                "/api/workspaces/default/tasks/task-1/results",
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()[0]["id"], "result-1")
+
+    def test_individual_result_retrieval(self):
+        response, _ = self.request(
+            "get",
+            "/api/workspaces/default/results/result-1",
+            "app.api.get_authorized_task_result",
+            {"id": "result-1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_audit_listing_uses_authorization(self):
+        response, mocked = self.request(
+            "get",
+            "/api/workspaces/default/audit",
+            "app.api.list_authorized_workspace_audit",
+            [],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        mocked.assert_called_once_with("test-user", "default")
+
+    def test_missing_audit_event_returns_404(self):
+        response, _ = self.request(
+            "get",
+            "/api/workspaces/default/audit/missing",
+            "app.api.get_authorized_workspace_audit_event",
+            None,
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_task_submission_passes_authenticated_actor(self):
+        from unittest.mock import patch
+
+        with patch(
+            "app.api.get_session",
+            return_value=self.user,
+        ), patch(
+            "app.api.submit_task",
+            return_value="task-123",
+        ) as mocked:
+            response = self.client.post(
+                "/api/workspaces/default/tasks",
+                headers=self.headers,
+                json={
+                    "title": "Security test",
+                    "description": "Verify task submission",
+                    "priority": 5,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["task_id"], "task-123")
+        self.assertEqual(
+            mocked.call_args.kwargs["actor_id"],
+            "test-user",
+        )
+
+    def test_task_submission_denied_without_workspace_access(self):
+        from unittest.mock import patch
+
+        with patch(
+            "app.api.get_session",
+            return_value=self.user,
+        ), patch(
+            "app.api.submit_task",
+            side_effect=PermissionError,
+        ):
+            response = self.client.post(
+                "/api/workspaces/other/tasks",
+                headers=self.headers,
+                json={
+                    "title": "Unauthorized task",
+                    "description": "Should be rejected",
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)

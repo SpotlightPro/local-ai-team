@@ -1,12 +1,12 @@
+
 import json
 import os
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from fastapi.responses import FileResponse
-from pathlib import Path
-
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -15,6 +15,12 @@ from app.auth.service import (
     get_session,
     get_authorized_task,
     list_authorized_tasks,
+    list_authorized_agent_executions,
+    get_authorized_agent_execution,
+    get_authorized_task_results,
+    get_authorized_task_result,
+    list_authorized_workspace_audit,
+    get_authorized_workspace_audit_event,
 )
 from app.tasks.queue import submit_task
 
@@ -116,6 +122,11 @@ def create_task(
             workspace_id,
             actor_id=user["user_id"],
         )
+    except PermissionError:
+        raise HTTPException(
+            403,
+            "Workspace access denied",
+        )
     except TypeError:
         raise HTTPException(
             500,
@@ -150,11 +161,127 @@ def task_status(
     return result
 
 
+@app.get("/api/workspaces/{workspace_id}/executions")
+def executions(
+    workspace_id: str,
+    user=Depends(authenticated_user),
+):
+    try:
+        return list_authorized_agent_executions(
+            user["user_id"],
+            workspace_id,
+        )
+    except PermissionError:
+        raise HTTPException(403, "Workspace access denied")
+
+
+@app.get("/api/workspaces/{workspace_id}/executions/{execution_id}")
+def execution_status(
+    workspace_id: str,
+    execution_id: str,
+    user=Depends(authenticated_user),
+):
+    try:
+        result = get_authorized_agent_execution(
+            user["user_id"],
+            execution_id,
+            workspace_id,
+        )
+    except PermissionError:
+        raise HTTPException(403, "Workspace access denied")
+
+    if result is None:
+        raise HTTPException(404, "Execution not found")
+
+    return result
+
+
+@app.get("/api/workspaces/{workspace_id}/tasks/{task_id}/results")
+def task_results(
+    workspace_id: str,
+    task_id: str,
+    user=Depends(authenticated_user),
+):
+    try:
+        task = get_authorized_task(
+            user["user_id"],
+            task_id,
+            workspace_id,
+        )
+
+        if task is None:
+            raise HTTPException(404, "Task not found")
+
+        return get_authorized_task_results(
+            user["user_id"],
+            task_id,
+            workspace_id,
+        )
+    except PermissionError:
+        raise HTTPException(403, "Workspace access denied")
+
+
+@app.get("/api/workspaces/{workspace_id}/results/{result_id}")
+def task_result(
+    workspace_id: str,
+    result_id: str,
+    user=Depends(authenticated_user),
+):
+    try:
+        result = get_authorized_task_result(
+            user["user_id"],
+            result_id,
+            workspace_id,
+        )
+    except PermissionError:
+        raise HTTPException(403, "Workspace access denied")
+
+    if result is None:
+        raise HTTPException(404, "Result not found")
+
+    return result
+
+
+@app.get("/api/workspaces/{workspace_id}/audit")
+def workspace_audit(
+    workspace_id: str,
+    user=Depends(authenticated_user),
+):
+    try:
+        return list_authorized_workspace_audit(
+            user["user_id"],
+            workspace_id,
+        )
+    except PermissionError:
+        raise HTTPException(403, "Workspace access denied")
+
+
+@app.get("/api/workspaces/{workspace_id}/audit/{event_id}")
+def workspace_audit_event(
+    workspace_id: str,
+    event_id: str,
+    user=Depends(authenticated_user),
+):
+    try:
+        result = get_authorized_workspace_audit_event(
+            user["user_id"],
+            event_id,
+            workspace_id,
+        )
+    except PermissionError:
+        raise HTTPException(403, "Workspace access denied")
+
+    if result is None:
+        raise HTTPException(404, "Audit event not found")
+
+    return result
+
+
 @app.get("/api/ollama/models")
 def ollama_models(user=Depends(authenticated_user)):
     base_url = os.environ.get(
         "OLLAMA_BASE_URL",
-        "http://127.0.0.1:11434",
+        "http://192.168.1.7:11434",
     ).rstrip("/")
 
     try:

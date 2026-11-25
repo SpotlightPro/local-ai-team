@@ -96,7 +96,8 @@ def main():
                 args.description,
                 args.priority,
                 args.workspace,
-            )
+                actor_id=user_id,
+            ) 
             print("Task submitted successfully.")
             print("Task ID:", task_id)
 

@@ -27,9 +27,7 @@ class AuthorizationTests(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "test.db"
 
         self.db_patch = patch.object(
-            database,
-            "DATABASE_PATH",
-            self.db_path,
+            database, "DATABASE_PATH", self.db_path
         )
         self.db_patch.start()
 
@@ -37,27 +35,19 @@ class AuthorizationTests(unittest.TestCase):
         migrate()
 
         with database.connect() as db:
-            db.execute("""
-                INSERT INTO workspaces (id, name)
-                VALUES (?, 'Second workspace')
-            """, (str(uuid.uuid4()),))
-
-            self.workspace_b = db.execute("""
-                SELECT id FROM workspaces
-                WHERE name = 'Second workspace'
-            """).fetchone()["id"]
-
+            workspace_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO workspaces (id, name) VALUES (?, ?)",
+                (workspace_id, "Second workspace"),
+            )
             db.commit()
+
+        self.workspace_b = workspace_id
 
         self.admin_id = create_first_admin(
             "platformadmin",
-            "SecurePassword123!"
+            "SecurePassword123!",
         )
-
-        self.admin_token = login(
-            "platformadmin",
-            "SecurePassword123!"
-        )["token"]
 
     def tearDown(self):
         self.db_patch.stop()
@@ -65,48 +55,31 @@ class AuthorizationTests(unittest.TestCase):
 
     def test_first_admin_is_platform_admin(self):
         admin = require_platform_admin(self.admin_id)
-
-        self.assertEqual(
-            admin["platform_role"],
-            "platform_admin"
-        )
+        self.assertEqual(admin["platform_role"], "platform_admin")
 
     def test_second_admin_initialization_rejected(self):
         with self.assertRaises(RuntimeError):
-            create_first_admin(
-                "anotheradmin",
-                "AnotherPassword123!"
-            )
+            create_first_admin("anotheradmin", "AnotherPassword123!")
 
     def test_login_and_session(self):
-        session = login(
-            "platformadmin",
-            "SecurePassword123!"
-        )
-
+        session = login("platformadmin", "SecurePassword123!")
         self.assertIsNotNone(session)
         self.assertIsNotNone(get_session(session["token"]))
 
     def test_invalid_password_rejected(self):
-        self.assertIsNone(
-            login("platformadmin", "WrongPassword123!")
-        )
+        self.assertIsNone(login("platformadmin", "WrongPassword123!"))
 
     def test_logout_revokes_session(self):
         token = login(
-            "platformadmin",
-            "SecurePassword123!"
+            "platformadmin", "SecurePassword123!"
         )["token"]
-
         self.assertTrue(logout(token))
         self.assertIsNone(get_session(token))
 
     def test_platform_admin_access(self):
         result = require_workspace_access(
-            self.admin_id,
-            self.workspace_b
+            self.admin_id, self.workspace_b
         )
-
         self.assertEqual(result["role"], "platform_admin")
 
     def test_create_workspace_user(self):
@@ -117,13 +90,9 @@ class AuthorizationTests(unittest.TestCase):
             "manager",
             self.admin_id,
         )
-
         result = require_workspace_role(
-            user_id,
-            "default",
-            {"manager"}
+            user_id, "default", {"manager"}
         )
-
         self.assertEqual(result["role"], "manager")
 
     def test_cross_workspace_access_denied(self):
@@ -134,12 +103,8 @@ class AuthorizationTests(unittest.TestCase):
             "member",
             self.admin_id,
         )
-
         with self.assertRaises(PermissionError):
-            require_workspace_access(
-                user_id,
-                self.workspace_b
-            )
+            require_workspace_access(user_id, self.workspace_b)
 
     def test_manager_cannot_create_administrator(self):
         manager_id = create_user(
@@ -149,7 +114,6 @@ class AuthorizationTests(unittest.TestCase):
             "manager",
             self.admin_id,
         )
-
         with self.assertRaises(PermissionError):
             create_user(
                 "newadmin",
@@ -167,7 +131,6 @@ class AuthorizationTests(unittest.TestCase):
             "member",
             self.admin_id,
         )
-
         with self.assertRaises(PermissionError):
             list_users(member_id, "default")
 
@@ -179,12 +142,11 @@ class AuthorizationTests(unittest.TestCase):
             "viewer",
             self.admin_id,
         )
-
         with self.assertRaises(PermissionError):
             require_workspace_role(
                 viewer_id,
                 "default",
-                {"administrator", "manager"}
+                {"administrator", "manager"},
             )
 
     def test_deactivation_revokes_sessions(self):
@@ -195,16 +157,13 @@ class AuthorizationTests(unittest.TestCase):
             "member",
             self.admin_id,
         )
-
         token = login(
-            "temporary",
-            "TemporaryPassword123!"
+            "temporary", "TemporaryPassword123!"
         )["token"]
 
         self.assertTrue(
             set_user_active(user_id, False, self.admin_id)
         )
-
         self.assertIsNone(get_session(token))
 
     def test_inactive_user_cannot_login(self):
@@ -215,9 +174,7 @@ class AuthorizationTests(unittest.TestCase):
             "member",
             self.admin_id,
         )
-
         set_user_active(user_id, False, self.admin_id)
-
         self.assertIsNone(
             login("inactive", "InactivePassword123!")
         )

@@ -19,17 +19,38 @@ def timestamp(value):
     return value.isoformat(timespec="seconds")
 
 
-def submit_task(title, description, priority=5, workspace_id=None):
+def submit_task(
+    title,
+    description,
+    priority=5,
+    workspace_id=None,
+    actor_id=None,
+):
     task_id = str(uuid.uuid4())
     now = timestamp(utc_now())
+    workspace_id = workspace_id or "default"
 
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
 
         from app.workspaces.service import require_workspace
-        require_workspace(workspace_id or "default", db)
 
-        workspace_id = workspace_id or "default"
+        require_workspace(workspace_id, db)
+
+        # Authenticated submissions must have permission to create tasks.
+        if actor_id is not None:
+            from app.auth.service import require_workspace_access
+
+            require_workspace_access(
+                actor_id,
+                workspace_id,
+                allowed_roles={
+                    "administrator",
+                    "manager",
+                    "member",
+                },
+                db=db,
+            )
 
         db.execute("""
             INSERT INTO tasks (
@@ -38,8 +59,12 @@ def submit_task(title, description, priority=5, workspace_id=None):
             )
             VALUES (?, ?, ?, ?, 'pending', ?, ?)
         """, (
-            task_id, workspace_id, title,
-            description, priority, now
+            task_id,
+            workspace_id,
+            title,
+            description,
+            priority,
+            now,
         ))
 
         db.execute("""
@@ -50,16 +75,17 @@ def submit_task(title, description, priority=5, workspace_id=None):
             VALUES (?, ?, ?, ?, ?)
         """, (
             "task.submitted",
-            "user",
+            actor_id or "system",
             "task",
             task_id,
-            json.dumps({"title": title})
+            json.dumps({"title": title}),
         ))
+
         db.commit()
 
     return task_id
 
-
+    
 def claim_task(worker_id):
     now = utc_now()
     now_text = timestamp(now)
