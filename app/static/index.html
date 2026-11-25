@@ -222,6 +222,9 @@ async function loadModels() {
   }
 }
 
+let taskPollingInterval = null;
+let taskPollInFlight = false;
+
 async function loadTasks() {
   const container = document.getElementById("tasks");
 
@@ -232,8 +235,11 @@ async function loadTasks() {
 
     if (!tasks.length) {
       container.textContent = "No tasks yet. Create your first task above!";
-      return;
+      stopTaskPolling();
+      return tasks;
     }
+
+    let hasActiveTasks = false;
 
     tasks.forEach(task => {
       const item = document.createElement("div");
@@ -247,11 +253,50 @@ async function loadTasks() {
       description.textContent =
         "Status: " + (task.status || "Unknown");
 
+      const status = (task.status || "").toLowerCase();
+
+      if (["pending", "queued", "running", "processing"].includes(status)) {
+        hasActiveTasks = true;
+      }
+
       item.append(title, description);
       container.appendChild(item);
     });
+
+    if (hasActiveTasks) {
+      startTaskPolling();
+    } else {
+      stopTaskPolling();
+    }
+
+    return tasks;
+
   } catch (error) {
     container.textContent = error.message;
+    return null;
+  }
+}
+
+function startTaskPolling() {
+  if (taskPollingInterval !== null) return;
+
+  taskPollingInterval = setInterval(async () => {
+    if (taskPollInFlight) return;
+
+    taskPollInFlight = true;
+
+    try {
+      await loadTasks();
+    } finally {
+      taskPollInFlight = false;
+    }
+  }, 3000);
+}
+
+function stopTaskPolling() {
+  if (taskPollingInterval !== null) {
+    clearInterval(taskPollingInterval);
+    taskPollingInterval = null;
   }
 }
 
