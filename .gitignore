@@ -44,3 +44,4 @@ dist/
 *.egg-info/
 PROJECT_CONTINUITY*.md
 /Docs/
+*.bak.*
