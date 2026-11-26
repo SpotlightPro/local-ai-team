@@ -128,7 +128,11 @@ h1 { font-size:29px; margin-bottom:7px; }
     <div class="logo">✦</div>
     Local AI Team
   </div>
+  <div style="display:flex;align-items:center;gap:15px">
   <div class="status" id="connection">Connecting...</div>
+    <button id="logout" class="hidden" type="button"
+            onclick="logout()">Logout</button>
+  </div>
 </header>
 
 <section id="login" class="panel">
@@ -225,11 +229,31 @@ async function request(path, options = {}) {
   return response.json();
 }
 
-function logout() {
+async function logout() {
+  const oldToken = token;
+
   token = null;
   localStorage.removeItem("local_ai_token");
+
+  stopTaskPolling();
+
   document.getElementById("dashboard").classList.add("hidden");
   document.getElementById("login").classList.remove("hidden");
+  document.getElementById("logout").classList.add("hidden");
+  document.getElementById("connection").textContent = "Signed out";
+
+  if (oldToken) {
+    try {
+      await fetch(API + "/auth/logout", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + oldToken
+        }
+      });
+    } catch (error) {
+      console.error("Server logout failed:", error);
+    }
+  }
 }
 
 async function loadDashboard() {
@@ -237,6 +261,7 @@ async function loadDashboard() {
 
   document.getElementById("login").classList.add("hidden");
   document.getElementById("dashboard").classList.remove("hidden");
+  document.getElementById("logout").classList.remove("hidden");
   document.getElementById("connection").textContent =
     "Connected · " + user.username;
 

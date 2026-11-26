@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.auth.service import (
     login,
+    logout,
     get_session,
     get_authorized_task,
     list_authorized_tasks,
@@ -92,6 +93,20 @@ def me(user=Depends(authenticated_user)):
         "id": user["user_id"],
         "username": user["username"],
     }
+
+@app.post("/api/auth/logout")
+def logout_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer),
+):
+    if credentials is None:
+        raise HTTPException(401, "Authentication required")
+
+    revoked = logout(credentials.credentials)
+
+    if not revoked:
+        raise HTTPException(401, "Invalid or expired session")
+
+    return {"message": "Logged out successfully"}
 
 
 @app.get("/api/workspaces/{workspace_id}/tasks")
