@@ -6,6 +6,10 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 from fastapi import Depends, FastAPI, HTTPException, status, Request
+
+# Instantiate the FastAPI application.  This must be defined before any
+# middleware or route handlers so that the `app` object is available.
+app = FastAPI()
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -28,14 +32,20 @@ from app.auth.service import (
 )
 from app.workspaces.service import get_workspace, list_workspaces
 from app.providers.registry import get_providers
-from app.tasks.queue import submit_task
+@app.middleware("http")
+async def clear_authenticated_user_override(request: Request, call_next):
+    """Middleware to clear the :func:`authenticated_user` dependency
+    override after each request.
 
+    Some tests temporarily set ``app.dependency_overrides[authenticated_user]``
+    to inject a fake user.  Leaving that override in place would bleed state
+    into subsequent tests.  This middleware removes it after the response
+    has been processed, guaranteeing test isolation.
+    response = await call_next(request)
+    if authenticated_user in app.dependency_overrides:
+        del app.dependency_overrides[authenticated_user]
+    return response
 
-app = FastAPI(
-    title="Local AI Team",
-    description="Multi-agent AI orchestration platform",
-    version="0.1.0",
-)
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -130,7 +140,7 @@ def platform_status():
     """Return a simple health status for the platform.
 
     The UI uses this endpoint to update the *Platform status* panel.
-    The implementation is intentionally minimal – the endpoint simply
+    The implementation is intentionally minimal - the endpoint simply
     confirms that the API layer is reachable.  A more sophisticated
     implementation could expose metrics or version information.
     """
@@ -403,69 +413,56 @@ def create_user_endpoint(
     except Exception as e:
         # In a real system we might want to differentiate types of errors,
         # but for now we expose a generic 500 error with the message.
-        raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    # an administrator.  The original implementation removed the
+    """Return a list of Ollama models.
 
-    # --- Test‑time dependency override cleanup ---------------------------------
-    # The test suite may temporarily override the ``authenticated_user``
-    # dependency to simulate an administrator.  FastAPI stores overrides
-    # using the dependency function object as the key.  The original
-    # implementation attempted to delete the override using the string
-    # ``"authenticated_user"`` which does not match the function key,
-    # leaving the override in place for subsequent tests.  This patch
-    # correctly removes the override by checking for the function
-    # object itself.
-    if authenticated_user in app.dependency_overrides:
-        del app.dependency_overrides[authenticated_user]
+    The endpoint attempts to contact the Ollama HTTP API to fetch the
+    list of available models.  It implements the following error
+    handling strategy:
 
-# ---------------------------------------------------------------------------
-# Middleware to clear test‑time dependency overrides after each request.
-# ---------------------------------------------------------------------------
-@app.middleware("http")
-async def clear_dependency_overrides(request: Request, call_next):
-    """Clear any overridden dependencies after the request is processed.
+    * **Timeout or connection failure** - The endpoint returns
+      ``connected: False`` with an empty ``models`` list and a short
+      ``message`` explaining that Ollama is unavailable.
+    * **Invalid JSON** - A malformed response is treated the same as a
+      connection error; we do not expose the raw error to callers.
 
-    This middleware ensures that a temporary override injected by a test
-    (e.g., to provide an admin user) does not persist for subsequent
-    requests.  It checks for the presence of ``authenticated_user`` in
-    ``app.dependency_overrides`` and removes it if found.
-    """
-    response = await call_next(request)
-    if authenticated_user in app.dependency_overrides:
-        del app.dependency_overrides[authenticated_user]
-    return response
-
-
-@app.get("/api/ollama/models")
-def ollama_models(user=Depends(authenticated_user)):
+    The implementation preserves the original response format used by
+    the front-end and tests.
     base_url = os.environ.get(
         "OLLAMA_BASE_URL",
         "http://192.168.1.7:11434",
     ).rstrip("/")
 
+    # Allow the timeout to be overridden by the test suite.
+    timeout = int(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "5"))
+
     try:
-        with urlopen(base_url + "/api/tags", timeout=5) as response:
+        with urlopen(base_url + "/api/tags", timeout=timeout) as response:
             data = json.loads(response.read())
-
-        return {
-            "connected": True,
-            "models": [
-                {
-                    "name": model["name"],
-                    "size": model.get("size"),
-                }
-                for model in data.get("models", [])
-            ],
-        }
-
-    except (URLError, TimeoutError, ValueError, OSError):
+    except (URLError, TimeoutError, OSError, ValueError):
+        # Any network or JSON parsing error is reported as disconnected.
         return {
             "connected": False,
             "models": [],
             "message": "Ollama is unavailable",
         }
 
+    # Successful response – normalise the model data.
+    return {
+        "connected": True,
+        "models": [
+            {
+                "name": model["name"],
+                "size": model.get("size"),
+            }
+            for model in data.get("models", [])
+        ],
+    }
+
 
 @app.get("/", include_in_schema=False)
 def dashboard():
     index = Path(__file__).resolve().parent / "static" / "index.html"
     return FileResponse(index, media_type="text/html")
+
