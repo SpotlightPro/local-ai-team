@@ -231,6 +231,61 @@ class TaskQueueTests(unittest.TestCase):
             "worker-2",
         )
 
+    def test_task_lease_can_be_renewed(self):
+        task_id = self.create_task()
+        queue.claim_task("worker-1")
+
+        with database.connect() as db:
+            before = db.execute(
+                "SELECT lease_expires_at FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()["lease_expires_at"]
+
+        renewed = queue.renew_task_lease(
+            task_id,
+            "worker-1",
+        )
+
+        self.assertTrue(renewed)
+
+        with database.connect() as db:
+            after = db.execute(
+                "SELECT lease_expires_at FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()["lease_expires_at"]
+
+        self.assertGreaterEqual(after, before)
+
+    def test_wrong_worker_cannot_renew_lease(self):
+        task_id = self.create_task()
+        queue.claim_task("worker-1")
+
+        renewed = queue.renew_task_lease(
+            task_id,
+            "worker-2",
+        )
+
+        self.assertFalse(renewed)
+
+    def test_expired_worker_cannot_renew_lease(self):
+        task_id = self.create_task()
+        queue.claim_task("worker-1")
+
+        with database.connect() as db:
+            db.execute("""
+                UPDATE tasks
+                SET lease_expires_at =
+                    '2000-01-01T00:00:00+00:00'
+                WHERE id = ?
+            """, (task_id,))
+
+        renewed = queue.renew_task_lease(
+            task_id,
+            "worker-1",
+        )
+
+        self.assertFalse(renewed)
+
 
 if __name__ == "__main__":
     unittest.main()
