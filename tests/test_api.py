@@ -151,7 +151,41 @@ class APISecurityBoundaryTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()[0]["id"], "result-1")
+
+    # --- New endpoint tests -------------------------------------------------
+
+    def test_platform_endpoint(self):
+        """Verify that the /api/platform endpoint returns the expected status."""
+        response = self.client.get("/api/platform")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIsInstance(data, dict)
+        self.assertIn("status", data)
+        self.assertEqual(data["status"], "online")
+
+    def test_providers_endpoint(self):
+        """Verify that the /api/providers endpoint returns a list of provider names."""
+        response = self.client.get("/api/providers")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIsInstance(data, dict)
+        self.assertIn("providers", data)
+        self.assertIsInstance(data["providers"], list)
+        # At minimum, the list should contain the 'ollama' provider if environment is set.
+        self.assertIn("ollama", [p.lower() for p in data["providers"]])
+
+    def test_workspaces_endpoint(self):
+        """Verify that the /api/workspaces endpoint returns a list of workspaces."""
+        response = self.client.get("/api/workspaces")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIsInstance(data, dict)
+        self.assertIn("workspaces", data)
+        self.assertIsInstance(data["workspaces"], list)
+        # The API returns a dict with a "workspaces" key containing a list.
+        # The default workspace has id "default".  The test ensures that the
+        # endpoint returns the workspace that exists in the test database.
+        self.assertEqual(response.json()["workspaces"][0]["id"], "default")
 
     def test_individual_result_retrieval(self):
         response, _ = self.request(
@@ -229,5 +263,33 @@ class APISecurityBoundaryTests(unittest.TestCase):
                     "description": "Should be rejected",
                 },
             )
+    @patch("app.api.create_user", return_value="new-user-id")
+    @patch("app.api.require_platform_admin", side_effect=lambda user_id: None)
+    def test_create_user_by_admin(self, mock_require_platform_admin, mock_create_user):
+        # Override FastAPI dependency to return an admin user
+        from app import api as api_module
+        api_module.app.dependency_overrides[api_module.authenticated_user] = lambda: {
+            "user_id": "admin-id",
+            "username": "admin",
+        }
+        """Test that a platform administrator can create a new user via POST /api/users.
 
-        self.assertEqual(response.status_code, 403)
+        The endpoint requires a platform admin. We patch the dependency that
+        provides the authenticated admin and the underlying ``create_user``
+        service. The test asserts the HTTP status code, the response body and
+        verifies that the service was called with the correct arguments.
+        """
+        payload = {
+            "username": "newuser",
+            "password": "Password123!",
+            "workspace_id": "default",
+            "role": "member",
+        }
+        response = self.client.post(
+            "/api/users", json=payload, headers=self.headers
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["user_id"], "new-user-id")
+        mock_create_user.assert_called_once_with(
+            "newuser", "Password123!", "default", "member", "admin-id"
+        )

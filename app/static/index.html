@@ -143,6 +143,11 @@ h1 { font-size:29px; margin-bottom:7px; }
     <input id="username" required autocomplete="username">
     <label>Password</label>
     <input id="password" type="password" required autocomplete="current-password">
+    <!-- Remember me checkbox added for session persistence control -->
+    <label style="display:flex;align-items:center;gap:5px;margin-top:5px;">
+      <input type="checkbox" id="rememberMe">
+      Remember me
+    </label>
     <button type="submit">Sign in</button>
   </form>
   <p id="message"></p>
@@ -153,34 +158,34 @@ h1 { font-size:29px; margin-bottom:7px; }
   <p class="subtitle">Your local AI orchestration workspace.</p>
 
   <div class="grid">
-    <div class="panel">
-      <h2>Platform status</h2>
-      <div class="metric"><span class="dot"></span>Online</div>
-      <p class="muted">API connection established</p>
+      <div class="panel">
+        <h2>Platform status</h2>
+        <div class="metric" id="platformStatus"><span class="dot"></span>Loading...</div>
+        <p class="muted">API connection established</p>
+      </div>
+
+      <div class="panel">
+        <h2>AI Provider</h2>
+        <div class="metric" id="provider">Loading...</div>
+        <p class="muted">Local model infrastructure</p>
+      </div>
+
+      <div class="panel">
+        <h2>Available models</h2>
+        <div class="metric" id="modelCount">—</div>
+        <p class="muted">Models detected</p>
+      </div>
+      <div class="panel">
+        <h2>Available AI models</h2>
+        <div id="models" class="muted">Loading models...</div>
+      </div>
     </div>
 
-    <div class="panel">
-      <h2>AI Provider</h2>
-      <div class="metric" id="provider">Ollama</div>
-      <p class="muted">Local model infrastructure</p>
-    </div>
-
-    <div class="panel">
-      <h2>Available models</h2>
-      <div class="metric" id="modelCount">—</div>
-      <p class="muted">Models detected</p>
-    </div>
-
-    <div class="panel wide">
-      <h2>Available AI models</h2>
-      <div id="models" class="muted">Loading models...</div>
-    </div>
-
-    <div class="panel">
-      <h2>Workspace</h2>
-      <div class="metric">Default</div>
-      <p class="muted">Active workspace</p>
-    </div>
+      <div class="panel">
+        <h2>Workspace</h2>
+        <div class="metric" id="workspace">Loading...</div>
+        <p class="muted">Active workspace</p>
+      </div>
 
     <div class="panel full">
       <h2>Create a new task</h2>
@@ -203,7 +208,7 @@ h1 { font-size:29px; margin-bottom:7px; }
 
 <script>
 const API = "/api";
-let token = localStorage.getItem("local_ai_token");
+  let token = sessionStorage.getItem("local_ai_token") || localStorage.getItem("local_ai_token");
 
 const headers = () => ({
   "Authorization": "Bearer " + token,
@@ -234,6 +239,7 @@ async function logout() {
 
   token = null;
   localStorage.removeItem("local_ai_token");
+  sessionStorage.removeItem("local_ai_token");
 
   stopTaskPolling();
 
@@ -265,7 +271,7 @@ async function loadDashboard() {
   document.getElementById("connection").textContent =
     "Connected · " + user.username;
 
-  await Promise.allSettled([loadModels(), loadTasks()]);
+    await Promise.allSettled([loadModels(), loadTasks(), loadPlatformStatus(), loadProviders(), loadWorkspaces()]);
 }
 
 async function loadModels() {
@@ -283,6 +289,47 @@ async function loadModels() {
   } catch (error) {
     container.textContent = error.message;
   }
+}
+
+async function loadPlatformStatus() {
+    const statusEl = document.getElementById("platformStatus");
+    try {
+        const data = await request("/api/platform");
+        statusEl.textContent = data.status || "unknown";
+    } catch (error) {
+        statusEl.textContent = error.message;
+    }
+}
+
+async function loadProviders() {
+    const providerEl = document.getElementById("provider");
+    try {
+        const data = await request("/api/providers");
+        // Display first provider as a quick indicator
+        if (data.providers && data.providers.length > 0) {
+            providerEl.textContent = data.providers[0];
+        } else {
+            providerEl.textContent = "none";
+        }
+    } catch (error) {
+        providerEl.textContent = error.message;
+    }
+}
+
+async function loadWorkspaces() {
+    const workspaceEl = document.getElementById("workspace");
+    try {
+        const data = await request("/api/workspaces");
+        if (data.workspaces && data.workspaces.length > 0) {
+            // Show the first workspace name
+            const ws = data.workspaces[0];
+            workspaceEl.textContent = ws.name || ws.id || "Unnamed";
+        } else {
+            workspaceEl.textContent = "no workspaces";
+        }
+    } catch (error) {
+        workspaceEl.textContent = error.message;
+    }
 }
 
 let taskPollingInterval = null;
@@ -561,7 +608,17 @@ document.getElementById("loginForm").addEventListener("submit", async event => {
     if (!response.ok) throw new Error(data.detail || "Login failed");
 
     token = data.access_token;
-    localStorage.setItem("local_ai_token", token);
+    // Store the token based on the Remember me checkbox
+    const remember = document.getElementById("rememberMe").checked;
+    if (remember) {
+      // Persist token in localStorage and clear any sessionStorage token
+      localStorage.setItem("local_ai_token", token);
+      sessionStorage.removeItem("local_ai_token");
+    } else {
+      // Persist token in sessionStorage and clear any localStorage token
+      sessionStorage.setItem("local_ai_token", token);
+      localStorage.removeItem("local_ai_token");
+    }
 
     message.textContent = "";
     await loadDashboard();
