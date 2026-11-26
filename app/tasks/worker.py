@@ -103,6 +103,7 @@ def execute_task(task, worker_id):
             workspace_id=workspace_id,
             project_root=str(context["project_root"]),
             task_id=task_id,
+            cancellation_event=lease_lost,
         )
 
         if lease_lost.is_set():

@@ -1,7 +1,7 @@
 
 import threading
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, ANY
 
 from app.tasks import worker
 
@@ -140,6 +140,7 @@ class WorkerExecutionTests(unittest.TestCase):
             workspace_id="default",
             project_root="/tmp/test-project",
             task_id="task-123",
+            cancellation_event=ANY,
         )
 
         self.assertEqual(

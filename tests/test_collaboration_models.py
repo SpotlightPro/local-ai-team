@@ -1,4 +1,5 @@
 import os
+import threading
 import unittest
 from unittest.mock import patch, Mock
 
@@ -13,6 +14,33 @@ class FakeProvider:
 
 
 class CollaborationModelTests(unittest.TestCase):
+
+    def test_cancellation_stops_workflow_before_reviewer(self):
+        cancellation_event = threading.Event()
+
+        def execute_analyst(*args, **kwargs):
+            cancellation_event.set()
+            return "Completed analysis"
+
+        with patch.object(
+            collaboration, "create_agent"
+        ) as create_agent, patch.object(
+            collaboration,
+            "execute_tracked_agent",
+            side_effect=execute_analyst,
+        ):
+            with self.assertRaises(
+                collaboration.CollaborationCancelled
+            ):
+                collaboration.run_collaboration(
+                    task="Test task",
+                    workspace_id="default",
+                    project_root="/tmp",
+                    task_id="test-task",
+                    cancellation_event=cancellation_event,
+                )
+
+        create_agent.assert_called_once()
 
     def test_agents_have_independent_provider_instances(self):
         with patch.object(

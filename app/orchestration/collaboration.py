@@ -1,9 +1,9 @@
 import os
 import uuid
 from datetime import datetime, timezone
+from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict
 
 from app.agents.factory import create_agent
 from app.storage.database import connect, transaction
@@ -21,6 +21,54 @@ class CollaborationState(TypedDict):
     analysis: str
     critique: str
     final_report: str
+    cancellation_event: object
+
+
+class CollaborationCancelled(RuntimeError):
+    """Raised when a worker loses ownership of its task."""
+    pass
+
+
+def check_cancellation(state):
+    event = state.get("cancellation_event")
+
+    if event is not None and event.is_set():
+        raise CollaborationCancelled(
+            "Task ownership lost during collaboration"
+        )
+
+
+def update_execution_status(
+    execution_id,
+    task_id,
+    workspace_id,
+    status,
+    output,
+):
+    """Persist an execution result without crossing workspace boundaries."""
+
+    with connect() as db:
+        db.execute("""
+            UPDATE agent_executions
+            SET status = ?,
+                output = ?,
+                completed_at = ?
+            WHERE id = ?
+              AND task_id = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM tasks
+                  WHERE tasks.id = agent_executions.task_id
+                    AND tasks.workspace_id = ?
+              )
+        """, (
+            status,
+            output[:4000],
+            utc_now(),
+            execution_id,
+            task_id,
+            workspace_id,
+        ))
 
 
 def execute_tracked_agent(
@@ -30,6 +78,8 @@ def execute_tracked_agent(
     provider_name,
     prompt,
 ):
+    check_cancellation(state)
+
     execution_id = str(uuid.uuid4())
     started_at = utc_now()
 
@@ -38,12 +88,17 @@ def execute_tracked_agent(
     task_id = state["task_id"]
     workspace_id = state["workspace_id"]
 
+    # Verify workspace ownership before recording execution.
     with transaction() as db:
         task = db.execute("""
             SELECT 1
             FROM tasks
-            WHERE id = ? AND workspace_id = ?
-        """, (task_id, workspace_id)).fetchone()
+            WHERE id = ?
+              AND workspace_id = ?
+        """, (
+            task_id,
+            workspace_id,
+        )).fetchone()
 
         if task is None:
             raise ValueError(
@@ -52,8 +107,14 @@ def execute_tracked_agent(
 
         db.execute("""
             INSERT INTO agent_executions (
-                id, task_id, agent_name, provider, model,
-                status, input_summary, started_at
+                id,
+                task_id,
+                agent_name,
+                provider,
+                model,
+                status,
+                input_summary,
+                started_at
             )
             VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
         """, (
@@ -67,52 +128,43 @@ def execute_tracked_agent(
         ))
 
     try:
+        check_cancellation(state)
+
+        # Execute the AI provider.
         output = agent.execute(prompt)
 
-        with connect() as db:
-            db.execute("""
-                UPDATE agent_executions
-                SET status = 'completed',
-                    output = ?,
-                    completed_at = ?
-                WHERE id = ?
-                  AND task_id = ?
-                  AND EXISTS (
-                      SELECT 1 FROM tasks
-                      WHERE tasks.id = agent_executions.task_id
-                        AND tasks.workspace_id = ?
-                  )
-            """, (
-                output,
-                utc_now(),
-                execution_id,
-                task_id,
-                workspace_id,
-            ))
+        # Reject results if ownership was lost during generation.
+        check_cancellation(state)
+
+        update_execution_status(
+            execution_id,
+            task_id,
+            workspace_id,
+            "completed",
+            output,
+        )
+
+        # Check once more before passing results downstream.
+        check_cancellation(state)
 
         return output
 
     except Exception as error:
-        with connect() as db:
-            db.execute("""
-                UPDATE agent_executions
-                SET status = 'failed',
-                    output = ?,
-                    completed_at = ?
-                WHERE id = ?
-                  AND task_id = ?
-                  AND EXISTS (
-                      SELECT 1 FROM tasks
-                      WHERE tasks.id = agent_executions.task_id
-                        AND tasks.workspace_id = ?
-                  )
-            """, (
-                f"{type(error).__name__}: {error}"[:4000],
-                utc_now(),
-                execution_id,
-                task_id,
-                workspace_id,
-            ))
+
+        # Distinguish cancellation from an actual execution failure.
+        execution_status = (
+            "cancelled"
+            if isinstance(error, CollaborationCancelled)
+            else "failed"
+        )
+
+        update_execution_status(
+            execution_id,
+            task_id,
+            workspace_id,
+            execution_status,
+            f"{type(error).__name__}: {error}",
+        )
 
         raise
 
@@ -131,6 +183,8 @@ Do not claim to have performed external actions.
 
 
 def analyst_node(state: CollaborationState):
+    check_cancellation(state)
+
     agent = create_agent(
         name="Independent Analyst",
         role="Primary Analyst",
@@ -141,7 +195,10 @@ def analyst_node(state: CollaborationState):
         Identify uncertainties and assumptions.
         """,
         provider_name="ollama",
-        model=os.getenv("LOCAL_AI_ANALYST_MODEL", "gpt-oss-20b:32k"),
+        model=os.getenv(
+            "LOCAL_AI_ANALYST_MODEL",
+            "gpt-oss-20b:32k",
+        ),
     )
 
     prompt = (
@@ -151,13 +208,21 @@ def analyst_node(state: CollaborationState):
     )
 
     result = execute_tracked_agent(
-        state, agent, "Independent Analyst", "ollama", prompt
+        state,
+        agent,
+        "Independent Analyst",
+        "ollama",
+        prompt,
     )
+
+    check_cancellation(state)
 
     return {"analysis": result}
 
 
 def reviewer_node(state: CollaborationState):
+    check_cancellation(state)
+
     agent = create_agent(
         name="Critical Reviewer",
         role="Independent Critical Reviewer",
@@ -169,7 +234,10 @@ def reviewer_node(state: CollaborationState):
         Do not automatically agree with the analyst.
         """,
         provider_name="ollama",
-        model=os.getenv("LOCAL_AI_REVIEWER_MODEL", "llama3.2:latest"),
+        model=os.getenv(
+            "LOCAL_AI_REVIEWER_MODEL",
+            "llama3.2:latest",
+        ),
     )
 
     prompt = f"""
@@ -185,13 +253,21 @@ def reviewer_node(state: CollaborationState):
     """
 
     result = execute_tracked_agent(
-        state, agent, "Critical Reviewer", "ollama", prompt
+        state,
+        agent,
+        "Critical Reviewer",
+        "ollama",
+        prompt,
     )
+
+    check_cancellation(state)
 
     return {"critique": result}
 
 
 def coordinator_node(state: CollaborationState):
+    check_cancellation(state)
+
     agent = create_agent(
         name="Team Coordinator",
         role="Senior Technical Coordinator",
@@ -204,7 +280,10 @@ def coordinator_node(state: CollaborationState):
         Do not hide unresolved disagreements.
         """,
         provider_name="ollama",
-        model=os.getenv("LOCAL_AI_COORDINATOR_MODEL", "gpt-oss-20b:32k"),
+        model=os.getenv(
+            "LOCAL_AI_COORDINATOR_MODEL",
+            "gpt-oss-20b:32k",
+        ),
     )
 
     prompt = f"""
@@ -229,8 +308,14 @@ def coordinator_node(state: CollaborationState):
     """
 
     result = execute_tracked_agent(
-        state, agent, "Team Coordinator", "ollama", prompt
+        state,
+        agent,
+        "Team Coordinator",
+        "ollama",
+        prompt,
     )
+
+    check_cancellation(state)
 
     return {"final_report": result}
 
@@ -255,10 +340,15 @@ def run_collaboration(
     workspace_id: str,
     project_root: str,
     task_id: str,
+    cancellation_event=None,
 ):
+    check_cancellation({
+        "cancellation_event": cancellation_event,
+    })
+
     workflow = build_collaboration_graph()
 
-    return workflow.invoke({
+    result = workflow.invoke({
         "task": task,
         "task_id": task_id,
         "workspace_id": workspace_id,
@@ -266,4 +356,11 @@ def run_collaboration(
         "analysis": "",
         "critique": "",
         "final_report": "",
+        "cancellation_event": cancellation_event,
     })
+
+    check_cancellation({
+        "cancellation_event": cancellation_event,
+    })
+
+    return result
