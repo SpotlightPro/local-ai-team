@@ -446,6 +446,8 @@ async function loadTasks() {
           expandedTaskIds.add(taskId);
         }
 
+        // Force rendering after expanding or collapsing results.
+        lastTaskSnapshot = null;
         loadTasks();
       });
 
