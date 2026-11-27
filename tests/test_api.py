@@ -263,33 +263,49 @@ class APISecurityBoundaryTests(unittest.TestCase):
                     "description": "Should be rejected",
                 },
             )
+    
     @patch("app.api.create_user", return_value="new-user-id")
     @patch("app.api.require_platform_admin", side_effect=lambda user_id: None)
     def test_create_user_by_admin(self, mock_require_platform_admin, mock_create_user):
-        # Override FastAPI dependency to return an admin user
         from app import api as api_module
-        api_module.app.dependency_overrides[api_module.authenticated_user] = lambda: {
+
+        api_module.app.dependency_overrides[
+            api_module.authenticated_user
+        ] = lambda: {
             "user_id": "admin-id",
             "username": "admin",
         }
-        """Test that a platform administrator can create a new user via POST /api/users.
 
-        The endpoint requires a platform admin. We patch the dependency that
-        provides the authenticated admin and the underlying ``create_user``
-        service. The test asserts the HTTP status code, the response body and
-        verifies that the service was called with the correct arguments.
-        """
-        payload = {
-            "username": "newuser",
-            "password": "Password123!",
-            "workspace_id": "default",
-            "role": "member",
-        }
-        response = self.client.post(
-            "/api/users", json=payload, headers=self.headers
-        )
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.json()["user_id"], "new-user-id")
-        mock_create_user.assert_called_once_with(
-            "newuser", "Password123!", "default", "member", "admin-id"
-        )
+        try:
+            payload = {
+                "username": "newuser",
+                "password": "Password123!",
+                "workspace_id": "default",
+                "role": "member",
+            }
+
+            response = self.client.post(
+                "/api/users",
+                json=payload,
+                headers=self.headers,
+            )
+
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(
+                response.json(),
+                {"user_id": "new-user-id"},
+            )
+
+            mock_require_platform_admin.assert_called_once_with("admin-id")
+            mock_create_user.assert_called_once_with(
+                "newuser",
+                "Password123!",
+                "default",
+                "member",
+                "admin-id",
+            )
+
+        finally:
+            api_module.app.dependency_overrides.pop(
+                api_module.authenticated_user, None
+            )

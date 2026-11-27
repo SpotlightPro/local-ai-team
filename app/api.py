@@ -1,11 +1,14 @@
 
 import json
+from json import JSONDecodeError
 import os
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from fastapi import Depends, FastAPI, HTTPException, status, Request
+import logging
+from fastapi import Depends, FastAPI, HTTPException, status
+logger = logging.getLogger("app.api")
 
 # Instantiate the FastAPI application.  This must be defined before any
 # middleware or route handlers so that the `app` object is available.
@@ -13,7 +16,6 @@ app = FastAPI()
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-
 from app.auth.service import (
     login,
     logout,
@@ -28,23 +30,11 @@ from app.auth.service import (
     get_authorized_workspace_audit_event,
     create_user,
     require_platform_admin,
-    require_platform_admin as platform_admin,
 )
-from app.workspaces.service import get_workspace, list_workspaces
 from app.providers.registry import get_providers
-@app.middleware("http")
-async def clear_authenticated_user_override(request: Request, call_next):
-    """Middleware to clear the :func:`authenticated_user` dependency
-    override after each request.
-
-    Some tests temporarily set ``app.dependency_overrides[authenticated_user]``
-    to inject a fake user.  Leaving that override in place would bleed state
-    into subsequent tests.  This middleware removes it after the response
-    has been processed, guaranteeing test isolation.
-    response = await call_next(request)
-    if authenticated_user in app.dependency_overrides:
-        del app.dependency_overrides[authenticated_user]
-    return response
+from app.workspaces.service import list_workspaces
+from app.tasks.queue import submit_task
+    # the top of the file tidy and avoid circular dependencies.
 
 
 bearer = HTTPBearer(auto_error=False)
@@ -130,7 +120,7 @@ def logout_user(
 
     return {"message": "Logged out successfully"}
 
-
+# New platform-level endpoints
 # ---------------------------------------------------------------------------
 # New platform‑level endpoints
 # ---------------------------------------------------------------------------
@@ -374,8 +364,6 @@ def workspace_audit_event(
 
     return result
 
-    return result
-
 @app.post("/api/users", status_code=201)
 def create_user_endpoint(
     user_data: UserCreateRequest,
@@ -408,40 +396,64 @@ def create_user_endpoint(
             user_data.role,
             actor_id,
         )
-        # Return only the user_id as per the API contract
+        # Return the newly created user id in the response. The tests expect
+        # the key ``user_id`` with the id returned from the service.
         return {"user_id": new_user_id}
     except Exception as e:
-        # In a real system we might want to differentiate types of errors,
-        # but for now we expose a generic 500 error with the message.
-        raise HTTPException(status_code=500, detail=str(e))
-    # an administrator.  The original implementation removed the
+        # Log the exception and return a generic error response.  The
+        # ``logging`` module is used instead of printing to keep the
+        # implementation test‑friendly.
+        logger.exception("Error creating user: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create user")
+@app.get("/api/ollama/models")
+def ollama_models():
     """Return a list of Ollama models.
 
     The endpoint attempts to contact the Ollama HTTP API to fetch the
-    list of available models.  It implements the following error
+    list of available models. It implements the following error
     handling strategy:
-
     * **Timeout or connection failure** - The endpoint returns
       ``connected: False`` with an empty ``models`` list and a short
       ``message`` explaining that Ollama is unavailable.
     * **Invalid JSON** - A malformed response is treated the same as a
       connection error; we do not expose the raw error to callers.
-
-    The implementation preserves the original response format used by
-    the front-end and tests.
-    base_url = os.environ.get(
-        "OLLAMA_BASE_URL",
-        "http://192.168.1.7:11434",
-    ).rstrip("/")
+    """
+    base_url = os.environ.get("OLLAMA_BASE_URL")
+    if not base_url:
+        raise HTTPException(
+            status_code=400,
+            detail="OLLAMA_BASE_URL environment variable is not configured.",
+        )
+    base_url = base_url.rstrip("/")
 
     # Allow the timeout to be overridden by the test suite.
-    timeout = int(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "5"))
+    timeout_raw = os.environ.get("OLLAMA_REQUEST_TIMEOUT", "5")
+    try:
+        timeout = int(timeout_raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="OLLAMA_REQUEST_TIMEOUT must be an integer.",
+        )
+    if timeout <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="OLLAMA_REQUEST_TIMEOUT must be positive.",
+        )
 
     try:
         with urlopen(base_url + "/api/tags", timeout=timeout) as response:
-            data = json.loads(response.read())
-    except (URLError, TimeoutError, OSError, ValueError):
-        # Any network or JSON parsing error is reported as disconnected.
+            raw = response.read()
+            try:
+                data = json.loads(raw)
+            except JSONDecodeError as e:
+                # Malformed JSON
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Ollama returned invalid JSON: {e}",
+                )
+    except (URLError, TimeoutError, OSError) as e:
+        # Network errors
         return {
             "connected": False,
             "models": [],
@@ -459,7 +471,6 @@ def create_user_endpoint(
             for model in data.get("models", [])
         ],
     }
-
 
 @app.get("/", include_in_schema=False)
 def dashboard():
