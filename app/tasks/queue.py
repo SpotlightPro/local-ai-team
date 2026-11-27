@@ -379,6 +379,125 @@ def list_tasks(workspace_id="default"):
         return [dict(row) for row in rows]
 
 
+def _assert_task_in_workspace(task_id: str, workspace_id: str, db: sqlite3.Connection):
+    """Verify that the task belongs to the given workspace.
+
+    The function queries the ``tasks`` table and raises a ``RuntimeError``
+    if the task is not found or belongs to a different workspace.  This
+    helper is used by attachment‑related functions to enforce access
+    control.
+    """
+    task = db.execute(
+        "SELECT workspace_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None or task["workspace_id"] != workspace_id:
+        raise RuntimeError("Task does not belong to the requested workspace")
+
+
+def create_task_attachment(
+    task_id: str,
+    workspace_id: str,
+    filename: str,
+    relative_path: str,
+    mime_type: str,
+    file_size: int,
+):
+    """Create a new attachment metadata record.
+
+    Parameters
+    ----------
+    task_id: str
+        Identifier of the parent task.
+    workspace_id: str
+        Workspace that owns the task.
+    filename: str
+        Original file name.
+    relative_path: str
+        Path relative to the workspace root where the file is stored.
+    mime_type: str
+        MIME type of the file.
+    file_size: int
+        Size of the file in bytes.
+
+    Returns
+    -------
+    dict
+        Dictionary containing the attachment metadata (excluding binary data).
+    """
+    attachment_id = str(uuid.uuid4())
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        # Validate workspace exists and task belongs to it
+        from app.workspaces.service import require_workspace
+        require_workspace(workspace_id, db)
+        _assert_task_in_workspace(task_id, workspace_id, db)
+
+        db.execute(
+            "INSERT INTO task_attachments (id, task_id, workspace_id, filename, relative_path, mime_type, file_size) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                attachment_id,
+                task_id,
+                workspace_id,
+                filename,
+                relative_path,
+                mime_type,
+                file_size,
+            ),
+        )
+        db.commit()
+    # Retrieve the inserted row to return all fields, including created_at
+    with closing(connect()) as db:
+        row = db.execute(
+            "SELECT id, task_id, workspace_id, filename, relative_path, mime_type, file_size, created_at FROM task_attachments WHERE id = ?",
+            (attachment_id,),
+        ).fetchone()
+    return dict(row)
+
+
+def list_task_attachments(task_id: str, workspace_id: str):
+    """Return a list of attachment metadata for the specified task.
+
+    The function ensures the task exists within the provided workspace and
+    returns all attachments sorted by creation time.
+    """
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        from app.workspaces.service import require_workspace
+        require_workspace(workspace_id, db)
+        _assert_task_in_workspace(task_id, workspace_id, db)
+        rows = db.execute(
+            "SELECT id, task_id, workspace_id, filename, relative_path, mime_type, file_size, created_at FROM task_attachments WHERE task_id = ? AND workspace_id = ? ORDER BY created_at",
+            (task_id, workspace_id),
+        ).fetchall()
+        db.commit()
+    return [dict(row) for row in rows]
+
+
+def delete_task_attachment(attachment_id: str, workspace_id: str):
+    """Delete the attachment record identified by ``attachment_id``.
+
+    The function verifies that the attachment belongs to the supplied
+    workspace before deletion.  It returns ``True`` if a row was deleted
+    and ``False`` otherwise.
+    """
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        from app.workspaces.service import require_workspace
+        require_workspace(workspace_id, db)
+        # Fetch attachment to verify workspace ownership
+        row = db.execute(
+            "SELECT task_id FROM task_attachments WHERE id = ? AND workspace_id = ?",
+            (attachment_id, workspace_id),
+        ).fetchone()
+        if row is None:
+            db.commit()
+            return False
+        # Ensure the task also belongs to the workspace
+        _assert_task_in_workspace(row["task_id"], workspace_id, db)
+        db.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
+        db.commit()
+    return True
 def list_agent_executions(workspace_id="default"):
     from app.workspaces.service import require_workspace
 

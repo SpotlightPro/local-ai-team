@@ -4,6 +4,7 @@ import secrets
 import uuid
 
 from pathlib import Path
+import stat
 
 from app.storage.database import connect
 
@@ -535,3 +536,279 @@ def write_workspace_artifact(workspace_id, relative_path, content):
         os.close(artifacts_fd)
 
     return artifacts_root / relative_path
+
+# ---------------------------------------------------------------------------
+# Binary image helpers – Phase 1, Task 1
+# ---------------------------------------------------------------------------
+
+def write_workspace_image(
+    workspace_id: str,
+    relative_path: str,
+    image_bytes: bytes,
+):
+    """Write binary image data to the workspace artifact directory.
+
+    The implementation mirrors the existing text‑artifact writer but
+    operates on raw ``bytes``.  It uses the same descriptor‑based
+    traversal and symlink protection that the text writer relies on.
+
+    Parameters
+    ----------
+    workspace_id:
+        Identifier of the workspace.
+    relative_path:
+        Path relative to the artifacts root.  Must be a non‑empty
+        relative path without ``..`` components, null bytes, or
+        leading slashes.
+    image_bytes:
+        Binary image payload.
+
+    Returns
+    -------
+    pathlib.Path
+        Absolute path of the written file.
+    """
+    # Validate type of payload
+    if not isinstance(image_bytes, (bytes, bytearray)):
+        raise ValueError("image_bytes must be bytes")
+
+    relative_path = Path(relative_path)
+
+    # Path validation – same as write_workspace_artifact
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or ".." in relative_path.parts
+        or "\x00" in str(relative_path)
+    ):
+        raise ValueError("Invalid artifact path")
+
+    # Open the artifacts directory using the existing helper
+    artifacts_fd = _open_workspace_artifacts(workspace_id)
+    parent_fd = artifacts_fd
+    opened_fds = []
+
+    try:
+        # Walk/create parent directories
+        for component in relative_path.parts[:-1]:
+            next_fd = _open_child_directory(parent_fd, component, create=True)
+            opened_fds.append(next_fd)
+            parent_fd = next_fd
+
+        filename = relative_path.parts[-1]
+        if filename in ("", ".", "..") or "/" in filename:
+            raise ValueError("Invalid artifact filename")
+
+        # Create a unique temporary file in the target directory
+        temp_name = f".{filename}.{secrets.token_hex(16)}.tmp"
+        file_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_fd,
+        )
+
+        try:
+            # Write the image bytes atomically
+            remaining = memoryview(image_bytes)
+            while remaining:
+                written = os.write(file_fd, remaining)
+                if written <= 0:
+                    raise OSError("Artifact write failed")
+                remaining = remaining[written:]
+            os.fsync(file_fd)
+        except Exception:
+            os.close(file_fd)
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        else:
+            os.close(file_fd)
+
+        # Atomically rename temp to final name; rename will fail if
+        # destination exists, satisfying the "never overwrite" rule.
+        # Use os.link to atomically create the destination file only if it
+        # does not already exist.  This guarantees a no‑overwrite
+        # operation that is safe from race conditions.
+        try:
+            os.link(
+                temp_name,
+                filename,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            # Ensure the directory entry is flushed to disk.
+            os.fsync(parent_fd)
+            # Remove the temporary file now that it has been safely
+            # linked into the final location.
+            os.unlink(temp_name, dir_fd=parent_fd)
+        except FileExistsError:
+            # Destination already existed – clean up the temp file and
+            # raise a clear error.
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            raise ValueError("Destination file already exists")
+        except Exception:
+            # Ensure the temporary file is removed on any other error.
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            raise
+
+        # Resolve the absolute path of the created file
+        artifacts_root = Path(os.path.realpath(f"/proc/self/fd/{artifacts_fd}"))
+        return artifacts_root / relative_path
+
+    finally:
+        for fd in reversed(opened_fds):
+            os.close(fd)
+        os.close(artifacts_fd)
+
+
+def read_workspace_image(
+    workspace_id: str,
+    relative_path: str,
+    max_bytes: int = 10485760,
+):
+    """Read binary image data from the workspace artifact directory.
+
+    Parameters
+    ----------
+    workspace_id:
+        Identifier of the workspace.
+    relative_path:
+        Path relative to the artifacts root.  Must be validated the
+        same way as in the writer.
+    max_bytes:
+        Maximum number of bytes to read.  Reading stops when this
+        threshold is reached or the file ends.  The function raises
+        ``ValueError`` if the file is larger than ``max_bytes``.
+    """
+    relative_path = Path(relative_path)
+
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or ".." in relative_path.parts
+        or "\x00" in str(relative_path)
+    ):
+        raise ValueError("Invalid artifact path")
+
+    artifacts_fd = _open_workspace_artifacts(workspace_id)
+    parent_fd = artifacts_fd
+    opened_fds = []
+
+    try:
+        # Traverse to the directory containing the file
+        for component in relative_path.parts[:-1]:
+            next_fd = _open_child_directory(parent_fd, component, create=False)
+            opened_fds.append(next_fd)
+            parent_fd = next_fd
+
+        filename = relative_path.parts[-1]
+        if filename in ("", ".", "..") or "/" in filename:
+            raise ValueError("Invalid artifact filename")
+
+        file_fd = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        try:
+            # Verify regular file
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError("Requested artifact is not a regular file")
+            # Read up to max_bytes, but read one extra byte to detect
+            # overflow.  This ensures that a file exactly equal to
+            # max_bytes is accepted, while larger files trigger an error.
+            chunks = []
+            total = 0
+            while True:
+                to_read = min(8192, max_bytes + 1 - total)
+                if to_read <= 0:
+                    # No more bytes can be read without exceeding the limit
+                    break
+                chunk = os.read(file_fd, to_read)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("File exceeds max_bytes limit")
+            return b"".join(chunks)
+        finally:
+            os.close(file_fd)
+    finally:
+        for fd in reversed(opened_fds):
+            os.close(fd)
+        os.close(artifacts_fd)
+
+
+def delete_workspace_image(workspace_id: str, relative_path: str) -> None:
+    """Delete a single image artifact.
+
+    The function mirrors the path‑validation logic used by the binary writer
+    and performs the deletion in a descriptor‑based, symlink‑safe manner.
+
+    Parameters
+    ----------
+    workspace_id:
+        Identifier of the workspace whose artifact tree contains the file.
+    relative_path:
+        Artifact path relative to the workspace's artifact root.  Must be a
+        non‑empty relative path with no ``..`` components, null bytes or
+        leading slashes.
+    """
+
+    # ---- Path validation -------------------------------------------------
+    rp = Path(relative_path)
+    if (
+        rp.is_absolute()
+        or not rp.parts
+        or ".." in rp.parts
+        or "\x00" in str(rp)
+    ):
+        raise ValueError("Invalid artifact path")
+
+    # ---- Open the artifact root securely ---------------------------------
+    artifacts_fd = _open_workspace_artifacts(workspace_id)
+    parent_fd = artifacts_fd
+    opened_fds = []
+
+    try:
+        # Walk the path components without creating any new directories.
+        for comp in rp.parts[:-1]:
+            fd = _open_child_directory(parent_fd, comp, create=False)
+            opened_fds.append(fd)
+            parent_fd = fd
+
+        filename = rp.parts[-1]
+        if filename in ("", ".", "..") or "/" in filename:
+            raise ValueError("Invalid artifact filename")
+
+        # Ensure the target is a regular file (reject symlinks, dirs, etc.).
+        file_fd = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        try:
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError("Requested artifact is not a regular file")
+        finally:
+            os.close(file_fd)
+
+        # Perform the unlink relative to the open directory descriptor.
+        os.unlink(filename, dir_fd=parent_fd)
+    finally:
+        # Clean up all descriptors in reverse order.
+        for fd in reversed(opened_fds):
+            os.close(fd)
+        os.close(artifacts_fd)

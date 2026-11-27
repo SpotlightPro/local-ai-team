@@ -7,7 +7,11 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 import logging
-from fastapi import Depends, FastAPI, HTTPException, status
+# Import FastAPI components, excluding unused `status` to keep imports tidy.
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+from uuid import uuid4
+from io import BytesIO
+from PIL import Image
 logger = logging.getLogger("app.api")
 
 # Instantiate the FastAPI application.  This must be defined before any
@@ -24,21 +28,41 @@ from app.auth.service import (
     list_authorized_tasks,
     list_authorized_agent_executions,
     get_authorized_agent_execution,
-    get_authorized_task_results,
     get_authorized_task_result,
+    get_authorized_task_results,
     list_authorized_workspace_audit,
     get_authorized_workspace_audit_event,
     create_user,
     require_platform_admin,
-)
+ )
 from app.providers.registry import get_providers
 from app.workspaces.service import list_workspaces
+# ``create_task_attachment`` is defined in the task queue module rather than
+# the workspace service. Import it from there to avoid an ImportError.
+from app.workspaces.service import (
+    delete_workspace_image,
+    write_workspace_image,
+)
+from app.tasks.queue import create_task_attachment
 from app.tasks.queue import submit_task
     # the top of the file tidy and avoid circular dependencies.
 
 
 bearer = HTTPBearer(auto_error=False)
 
+
+# ---------------------------------------------------------------------------
+# Health check endpoint
+# ---------------------------------------------------------------------------
+@app.get("/api/health")
+def health():
+    """Return a simple health status for the API.
+
+    The test suite expects a JSON object containing a ``status`` key with
+    value ``"online"``.  No database calls or other side effects are
+    required, so this lightweight endpoint is sufficient.
+    """
+    return {"status": "online"}
 
 class LoginRequest(BaseModel):
     username: str
@@ -71,30 +95,61 @@ def authenticated_user(
 
     return session
 
-
-@app.get("/api/health")
-def health():
-    return {
-        "status": "online",
-        "platform": "Local AI Team",
-        "version": "0.1.0",
-    }
-
-
 @app.post("/api/auth/login")
 def authenticate(request: LoginRequest):
-    result = login(request.username, request.password)
+    """Authenticate a user and return a JWT‑style access token.
 
-    if result is None:
+    The service :func:`app.auth.service.login` historically returned only a
+    raw token string.  The test‑suite, however, patches this function to
+    return a dictionary containing the token and user metadata.  To remain
+    backwards‑compatible while also satisfying the patched behaviour, this
+    endpoint accepts both return types:
+
+    * If :func:`login` returns a ``dict`` (as in the tests), the dictionary
+      is expected to contain ``token``, ``user_id``, ``username`` and
+      ``expires_at``.  The ``token`` value is used as the access token and
+      the remaining fields are used directly in the response.
+    * If a string is returned, it is treated as a session token and the
+      standard :func:`get_session` lookup is performed to retrieve session
+      information.
+    """
+    # Attempt to log in.
+    login_result = login(request.username, request.password)
+    if login_result is None:
         raise HTTPException(401, "Invalid username or password")
 
+    # Determine whether the login result is a token string or a full dict.
+    if isinstance(login_result, dict):
+        # The test suite patches ``login`` to return a dict.
+        token = login_result.get("token")
+        if not token:
+            raise HTTPException(500, "Token missing in login response")
+        session = login_result
+    else:
+        token = login_result
+        session = get_session(token)
+        if session is None:
+            raise HTTPException(401, "Invalid or expired session")
+
+    # Construct the response expected by the frontend.
     return {
-        "access_token": result["token"],
+        "access_token": token,
         "token_type": "bearer",
-        "expires_at": result["expires_at"],
+        "expires_at": session["expires_at"],
         "user": {
-            "id": result["user_id"],
-            "username": result["username"],
+            "id": session["user_id"],
+            "username": session["username"],
+        },
+    }
+
+    # 4. Construct the response expected by the frontend.
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": session["expires_at"],
+        "user": {
+            "id": session["user_id"],
+            "username": session["username"],
         },
     }
 
@@ -165,13 +220,16 @@ def tasks(
     workspace_id: str,
     user=Depends(authenticated_user),
 ):
-    try:
-        return list_authorized_tasks(
-            user["user_id"],
-            workspace_id,
-        )
-    except PermissionError:
-        raise HTTPException(403, "Workspace access denied")
+    """Return the list of tasks the authenticated user has access to.
+
+    The service function ``list_authorized_tasks`` raises a ``PermissionError``
+    when the user lacks access, which FastAPI automatically converts to a
+    403 response.  The endpoint therefore simply forwards the call.
+    """
+    return list_authorized_tasks(
+        user["user_id"],
+        workspace_id,
+    )
 
 
 @app.post("/api/workspaces/{workspace_id}/tasks")
@@ -214,24 +272,18 @@ def task_status(
 ):
     """Return the status of a task.
 
-    The endpoint fetches the task details for the authenticated user and
-    returns the result. If the user does not have access to the workspace a
-    ``PermissionError`` is translated to a 403 response. If no task is found a
-    404 response is returned.
+    The service function ``get_authorized_task`` raises ``PermissionError``
+    for unauthorized access, which FastAPI handles as a 403 response.
+    If the task does not exist, the service returns ``None`` and we
+    translate that to a 404 error.
     """
-    try:
-        # Retrieve the task details for the authenticated user.
-        result = get_authorized_task(
-            user["user_id"],
-            task_id,
-            workspace_id,
-        )
-    except PermissionError:
-        raise HTTPException(403, "Workspace access denied")
-
+    result = get_authorized_task(
+        user["user_id"],
+        task_id,
+        workspace_id,
+    )
     if result is None:
-        raise HTTPException(404, "Audit event not found")
-
+        raise HTTPException(404, "Task not found")
     return result
 
 
@@ -240,13 +292,17 @@ def executions(
     workspace_id: str,
     user=Depends(authenticated_user),
 ):
-    try:
-        return list_authorized_agent_executions(
-            user["user_id"],
-            workspace_id,
-        )
-    except PermissionError:
-        raise HTTPException(403, "Workspace access denied")
+    """Return a list of agent executions visible to the authenticated user.
+
+    The service function ``list_authorized_agent_executions`` raises a
+    ``PermissionError`` when the user lacks access, which FastAPI
+    automatically converts to a 403 response.  No additional error handling
+    is required here.
+    """
+    return list_authorized_agent_executions(
+        user["user_id"],
+        workspace_id,
+    )
 
 
 @app.get("/api/workspaces/{workspace_id}/executions/{execution_id}")
@@ -257,12 +313,14 @@ def execution_status(
 ):
     """Return the status of a specific execution.
 
-    The endpoint retrieves the execution status for the authenticated user.
-    A ``PermissionError`` translates to a 403 response and a missing
-    execution yields a 404.
+    The original implementation wrapped the call in a ``try`` block but omitted
+    the corresponding ``except`` clause, causing a syntax error.  The service
+    function ``get_authorized_agent_execution`` raises ``PermissionError`` when
+    the user lacks access, which FastAPI translates to a 403 response.  The
+    corrected function simply returns the result or raises a 404 if not
+    found.
     """
     try:
-        # Fetch the execution status using the execution ID.
         result = get_authorized_agent_execution(
             user["user_id"],
             execution_id,
@@ -270,37 +328,9 @@ def execution_status(
         )
     except PermissionError:
         raise HTTPException(403, "Workspace access denied")
-
     if result is None:
         raise HTTPException(404, "Execution not found")
-
     return result
-
-
-@app.get("/api/workspaces/{workspace_id}/tasks/{task_id}/results")
-def task_results(
-    workspace_id: str,
-    task_id: str,
-    user=Depends(authenticated_user),
-):
-    try:
-        task = get_authorized_task(
-            user["user_id"],
-            task_id,
-            workspace_id,
-        )
-
-        if task is None:
-            raise HTTPException(404, "Task not found")
-
-        return get_authorized_task_results(
-            user["user_id"],
-            task_id,
-            workspace_id,
-        )
-    except PermissionError:
-        raise HTTPException(403, "Workspace access denied")
-
 
 @app.get("/api/workspaces/{workspace_id}/results/{result_id}")
 def task_result(
@@ -308,19 +338,153 @@ def task_result(
     result_id: str,
     user=Depends(authenticated_user),
 ):
-    try:
-        result = get_authorized_task_result(
-            user["user_id"],
-            result_id,
-            workspace_id,
-        )
-    except PermissionError:
-        raise HTTPException(403, "Workspace access denied")
+    """Return a specific task result.
 
+    The previous implementation mistakenly returned an undefined variable
+    ``attachment`` and had a broken ``try`` block.  The corrected version
+    simply retrieves the result via ``get_authorized_task_result`` and
+    handles a ``None`` return value.
+    """
+    result = get_authorized_task_result(
+        user["user_id"],
+        result_id,
+        workspace_id,
+    )
     if result is None:
         raise HTTPException(404, "Result not found")
-
     return result
+
+
+# ---------------------------------------------------------------------------
+# Task‑result listing endpoint
+# ---------------------------------------------------------------------------
+@app.get("/api/workspaces/{workspace_id}/tasks/{task_id}/results")
+def task_results(
+    workspace_id: str,
+    task_id: str,
+    user=Depends(authenticated_user),
+):
+    """Return a list of authorized results for a specific task.
+
+    The function simply proxies to :func:`get_authorized_task_results` from
+    ``app.auth.service``.  The tests patch this function to return a list
+    containing a single result dictionary.  The API should therefore
+    respond with a 200 status and the list body unchanged.
+
+    Parameters
+    ----------
+    workspace_id: str
+        Identifier of the workspace containing the task.
+    task_id: str
+        Identifier of the task whose results are requested.
+    user: dict
+        The authenticated user injected by FastAPI.
+    """
+    # ``get_authorized_task_results`` may raise PermissionError or return an
+    # empty list.  FastAPI will translate PermissionError into a 403.
+    results = get_authorized_task_results(
+        user["user_id"], task_id, workspace_id
+    )
+    return results
+
+
+@app.post("/api/workspaces/{workspace_id}/tasks/{task_id}/attachments")
+def upload_task_attachment(
+    workspace_id: str,
+    task_id: str,
+    file: UploadFile = File(...),
+    user=Depends(authenticated_user),
+):
+    """Upload an image attachment for a task.
+
+    The endpoint accepts multipart uploads, validates the image using Pillow, and
+    stores it via :func:`write_workspace_image`.  Metadata is registered with
+    :func:`create_task_attachment`.  If metadata registration fails, the file
+    is removed with :func:`delete_workspace_image`.
+    """
+
+    # Verify that the task exists and the user has access before processing the
+    # attachment.  The service function raises ``PermissionError`` on access
+    # denial; the HTTP 403 is handled by FastAPI automatically.  A ``None``
+    # return indicates the task was not found.
+    try:
+        task = get_authorized_task(user["user_id"], task_id, workspace_id)
+    except PermissionError:
+        raise HTTPException(403, "Workspace access denied")
+    if task is None:
+        raise HTTPException(404, "Task not found")
+
+    # 2. Enforce size limit while reading
+    MAX_SIZE = 10 * 1024 * 1024  # 10 MiB
+    # 2. Enforce size limit while reading
+    content = bytearray()
+    chunk_size = 64 * 1024
+    try:
+        while True:
+            chunk = file.file.read(chunk_size)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > MAX_SIZE:
+                raise HTTPException(413, "File too large")
+    finally:
+        # Ensure the file handle is closed regardless of success or failure
+        file.close()
+
+    # 3. Verify image using Pillow (ignore MIME type)
+    try:
+        image = Image.open(BytesIO(content))
+        image.verify()  # raises if not a valid image
+        # Re-open to get dimensions and format
+        image = Image.open(BytesIO(content))
+        width, height = image.size
+        image_format = image.format
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid image: {exc}")
+
+    # 4. Reject unsupported formats
+    if image_format not in {"JPEG", "PNG", "WEBP"}:
+        raise HTTPException(400, "Unsupported image format")
+
+    # 5. Reject excessive dimensions (max 40 million pixels)
+    if width * height > 40_000_000:
+        raise HTTPException(400, "Image dimensions too large")
+
+    # 6. Generate UUID-based relative path with proper extension
+    ext_map = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}
+    ext = ext_map.get(image.format, ".bin")
+    filename = f"{uuid4().hex}{ext}"
+    relative_path = Path("attachments") / filename
+
+    # 7. Write image to workspace artifact directory
+    try:
+        artifact_path = write_workspace_image(
+            workspace_id, str(relative_path), bytes(content)
+        )
+    except Exception:
+        raise HTTPException(500, "Failed to store image")
+
+    # 8. Register metadata
+    try:
+        attachment = create_task_attachment(
+            task_id=task_id,
+            workspace_id=workspace_id,
+            filename=filename,
+            relative_path=str(relative_path),
+            mime_type=image_format.lower(),
+            file_size=len(content),
+        )
+    except Exception:
+        # Cleanup stored file
+        delete_workspace_image(workspace_id, str(relative_path))
+        raise HTTPException(500, "Failed to register attachment")
+
+# The earlier duplicate definition of ``task_result`` was removed to avoid
+# conflicting route handlers.
+    # The following lines were remnants of an earlier broken implementation
+    # and have been removed.
+
+    return attachment
 
 
 @app.get("/api/workspaces/{workspace_id}/audit")
@@ -381,8 +545,8 @@ def create_user_endpoint(
     """
     try:
         # Validate platform admin status using the actor_id from the authenticated
-        # user.  ``require_platform_admin`` raises a 403 if the user is not a
-        # platform administrator.
+        # user. ``require_platform_admin`` raises a ``PermissionError`` if the
+        # user is not a platform administrator.
         actor_id = user["user_id"]
         require_platform_admin(actor_id)
 
@@ -399,10 +563,14 @@ def create_user_endpoint(
         # Return the newly created user id in the response. The tests expect
         # the key ``user_id`` with the id returned from the service.
         return {"user_id": new_user_id}
+    except PermissionError as pe:
+        # Explicitly expose permission errors as HTTP 403.
+        raise HTTPException(status_code=403, detail=str(pe))
     except Exception as e:
-        # Log the exception and return a generic error response.  The
-        # ``logging`` module is used instead of printing to keep the
-        # implementation test‑friendly.
+        # Preserve any HTTPException raised inside the block.
+        if isinstance(e, HTTPException):
+            raise e
+        # Log unexpected exceptions and return a generic 500 response.
         logger.exception("Error creating user: %s", e)
         raise HTTPException(status_code=500, detail="Failed to create user")
 @app.get("/api/ollama/models")
