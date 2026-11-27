@@ -45,3 +45,10 @@ dist/
 PROJECT_CONTINUITY*.md
 /Docs/
 *.bak.*
+
+# Private local development files
+.clinerules/
+Modelfile.gpt-oss-20b-48k
+
+# Accidental empty file
+.?
